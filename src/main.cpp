@@ -44,6 +44,7 @@ static constexpr int PIN_TOUCH_RST = 1;
 static constexpr uint8_t PAGE_COUNT = 2;
 static constexpr uint32_t CAPTURE_DURATION_MS = 5UL * 60UL * 1000UL;
 static constexpr size_t CSV_FLUSH_EVERY_ROWS = 20;
+static constexpr size_t CAPTURE_MIN_FREE_BYTES = 128 * 1024;
 
 static constexpr uint16_t VICTRON_COMPANY_ID = 0x02E1;
 static constexpr uint8_t VICTRON_PRODUCT_ADVERTISEMENT = 0x10;
@@ -112,7 +113,7 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(
     PIN_LCD_MOSI,
     GFX_NOT_DEFINED);
 
-Arduino_GFX *output_display = new Arduino_GC9A01(
+Arduino_GFX *gfx = new Arduino_GC9A01(
     bus,
     GFX_NOT_DEFINED,
     2,
@@ -120,7 +121,6 @@ Arduino_GFX *output_display = new Arduino_GC9A01(
     240,
     240);
 
-Arduino_GFX *gfx = new Arduino_Canvas(240, 240, output_display);  // Double buffer!
 
 Preferences secrets;
 WebServer settingsServer(80);
@@ -960,9 +960,17 @@ static int16_t aaTextWidth(const AaFont &font, const String &text) {
   return width;
 }
 
-static void drawAaText(const AaFont &font, const String &text, int16_t x, int16_t y, uint16_t color) {
+static void drawAaTextTo(Arduino_GFX *target,
+                         const AaFont &font,
+                         const String &text,
+                         int16_t x,
+                         int16_t y,
+                         uint16_t color,
+                         uint16_t background) {
+
   int16_t cursorX = x;
   AaGlyph glyph;
+
   for (size_t i = 0; i < text.length(); i++) {
     if (!readAaGlyph(font, text[i], glyph)) {
       continue;
@@ -970,22 +978,72 @@ static void drawAaText(const AaFont &font, const String &text, int16_t x, int16_
 
     for (uint8_t py = 0; py < glyph.h; py++) {
       for (uint8_t px = 0; px < glyph.w; px++) {
-        uint8_t alpha = pgm_read_byte(font.bitmap + glyph.offset + py * glyph.w + px);
+        uint8_t alpha =
+            pgm_read_byte(font.bitmap + glyph.offset + py * glyph.w + px);
+
         if (alpha == 0) {
           continue;
         }
-        gfx->drawPixel(cursorX + glyph.xOffset + px,
-                       y + glyph.yOffset + py,
-                       blend565(color, COLOR_PANEL_BLUE, alpha));
+
+        target->drawPixel(
+            cursorX + glyph.xOffset + px,
+            y + glyph.yOffset + py,
+            blend565(color, background, alpha));
       }
     }
+
     cursorX += glyph.xAdvance;
   }
 }
 
-static void drawAaCentered(const AaFont &font, const String &text, int16_t centerX, int16_t topY, uint16_t color) {
+static void drawAaText(const AaFont &font,
+                       const String &text,
+                       int16_t x,
+                       int16_t y,
+                       uint16_t color) {
+
+  drawAaTextTo(
+      gfx,
+      font,
+      text,
+      x,
+      y,
+      color,
+      COLOR_PANEL_BLUE);
+}
+
+static void drawAaCenteredTo(Arduino_GFX *target,
+                             const AaFont &font,
+                             const String &text,
+                             int16_t centerX,
+                             int16_t topY,
+                             uint16_t color,
+                             uint16_t background) {
   int16_t width = aaTextWidth(font, text);
-  drawAaText(font, text, centerX - width / 2, topY, color);
+
+  drawAaTextTo(
+      target,
+      font,
+      text,
+      centerX - width / 2,
+      topY,
+      color,
+      background);
+}
+
+static void drawAaCentered(const AaFont &font,
+                           const String &text,
+                           int16_t centerX,
+                           int16_t topY,
+                           uint16_t color) {
+  drawAaCenteredTo(
+      gfx,
+      font,
+      text,
+      centerX,
+      topY,
+      color,
+      COLOR_PANEL_BLUE);
 }
 
 static bool touchReadBytes(uint8_t reg, uint8_t *buffer, size_t len) {
@@ -1383,7 +1441,24 @@ static void cancelCapture(const char *reason) {
 
 static void startCapture() {
   closeCaptureFile();
-  LittleFS.remove("/capture.csv");
+  //LittleFS.remove("/capture.csv"); previous code to clear littlefs  
+  
+  // The below will keep only one capture file at a time, and will remove the previous capture if it exists.
+  // Remove temporary capture file.
+  if (LittleFS.exists("/capture.csv")) {
+    LittleFS.remove("/capture.csv");
+}
+
+  // Remove the previously saved capture.
+  if (captureSaved && LittleFS.exists(capturePath)) {
+    LittleFS.remove(capturePath);
+  }
+
+  captureSaved = false;
+  captureReadyScreenActive = false;
+
+  // Ensure there is enough free space for the capture file.
+  static constexpr size_t CAPTURE_MIN_FREE_BYTES = 128 * 1024;
 
   capturePath = "/capture.csv";
   captureFilename = "capture.csv";
@@ -1447,6 +1522,15 @@ static void captureAdvert(const NimBLEAdvertisedDevice *device) {
     return;
   }
 
+  size_t totalBytes = LittleFS.totalBytes();
+  size_t usedBytes = LittleFS.usedBytes();
+  size_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
+
+  if (freeBytes < CAPTURE_MIN_FREE_BYTES) {
+   stopCapture("storage limit");
+    return;
+  }
+
   String address = device->getAddress().toString().c_str();
   String name = advertisedName(device);
   int rssi = device->getRSSI();
@@ -1487,8 +1571,9 @@ static void captureAdvert(const NimBLEAdvertisedDevice *device) {
   line += ",";
   line += csvEscape(vectorToHex(device->getPayload()));
 
-  if (captureFile.println(line) == 0) {
+  if (captureFile.println(line) == 0) { // write failed
     captureDroppedCount++;
+    stopCapture("write failed");
     return;
   }
 
@@ -2398,7 +2483,6 @@ static void drawSettingsPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static uint8_t displayRotationForDegrees(int degrees) {
@@ -2423,9 +2507,8 @@ static void setScreenRotationDegrees(int degrees) {
   if (nextRotation != currentDisplayRotation) {
     currentDisplayRotation = nextRotation;
 
-    // Only the physical panel rotates; Canvas::flush() blits unrotated, so the
-    // canvas itself must stay at rotation 0 (see setup()).
-    output_display->setRotation(currentDisplayRotation);
+    // Rotate the display to the selected orientation.
+    gfx->setRotation(currentDisplayRotation);
 
     invalidateScreens();
   }
@@ -2454,7 +2537,6 @@ static void drawRotationSettingsPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static String savedStatus(bool saved) {
@@ -2491,7 +2573,6 @@ static void drawSettingsInfoPage(bool force = false) {
 
   drawBackButton();
   settingsPageDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static void drawGaugeFace() {
@@ -2503,7 +2584,6 @@ static void drawGaugeFace() {
   gfx->fillCircle(120, 120, GAUGE_CLEAR_RADIUS, COLOR_PANEL_BLUE);
   gaugeFaceDrawn = true;
   gaugeValuesDrawn = false;
-  gfx->flush();  // Push canvas to screen
 }
 
 static void drawBatteryValueGridAt(int16_t centerX) {
@@ -2647,7 +2727,6 @@ static void drawPageTwo(bool force = false) {
   drawSettingsButton(COLOR_SOLAR_PANEL, COLOR_SOLAR_TEXT);
   pageTwoDrawn = true;
   solarValuesDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static void drawCaptureSecondRing(uint32_t remainingSeconds) {
@@ -2672,74 +2751,177 @@ static void drawCaptureSecondRing(uint32_t remainingSeconds) {
 
 static void drawCapturePage(bool force = false) {
   uint32_t now = millis();
-  if (!force && capturePageDrawn && now - lastCapturePageDrawMs < 1000) {
+
+  // Once capture has finished, the saved/download screen is static.
+  if (!captureActive && capturePageDrawn && !force) {
     return;
   }
+
+  // While recording, update at most once per second.
+  if (captureActive &&
+      !force &&
+      capturePageDrawn &&
+      now - lastCapturePageDrawMs < 1000) {
+    return;
+  }
+
   lastCapturePageDrawMs = now;
 
   uint32_t remaining = captureActive ? captureRemainingSeconds() : 0;
+
   String timerText;
   String statusText;
+
   if (captureActive) {
     char timerBuffer[8];
-    snprintf(timerBuffer, sizeof(timerBuffer), "%lu-%02lu",
+    snprintf(timerBuffer,
+             sizeof(timerBuffer),
+             "%lu-%02lu",
              static_cast<unsigned long>(remaining / 60),
              static_cast<unsigned long>(remaining % 60));
+
     timerText = timerBuffer;
     statusText = "Recording";
   } else if (captureSaved) {
     timerText = "";
-    statusText = settingsServerActive ? "Download via WiFi" : "Start WiFi to download";
+    statusText = settingsServerActive
+                     ? "Download via WiFi"
+                     : "Start WiFi to download";
   } else {
     timerText = "Idle";
     statusText = "Use WiFi page";
   }
 
-  gfx->fillScreen(COLOR_BLACK_SOFT);
-  gfx->fillCircle(120, 120, 108, 0x2104);
+  // Draw static screen only when entering the page or explicitly forced.
+  if (!capturePageDrawn || force) {
+    gfx->fillScreen(COLOR_BLACK_SOFT);
+    gfx->fillCircle(120, 120, 108, 0x2104);
+
+  drawAaCenteredTo(gfx, AA_FONT_SMALL, "BLE Capture", 120, 20, WHITE, 0x2104);
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_DIM_TEXT);
+
+    gfx->setCursor(42, 118);
+    gfx->print("Packets");
+
+    gfx->setCursor(42, 138);
+    gfx->print("Strongest");
+
+    gfx->setCursor(42, 158);
+    gfx->print("RSSI");
+
+    if (captureActive) {
+      gfx->drawRect(78, 178, 84, 28, 0x6B4D);
+      gfx->fillRect(79, 179, 82, 26, 0x7820);
+      drawAaCentered(AA_FONT_SMALL, "Stop", 120, 176, WHITE);
+    } else if (captureSaved) {
+      gfx->drawRect(82, 178, 76, 28, 0x6B4D);
+      gfx->fillRect(83, 179, 74, 26, 0x24A7);
+      drawAaCentered(AA_FONT_SMALL, "Done", 120, 178, WHITE);
+    }
+  }
+
+  // Redraw only the changing second ring.
   drawCaptureSecondRing(remaining);
 
-  drawAaCentered(AA_FONT_SMALL, "BLE Capture", 120, 22, WHITE);
-  if (timerText.length()) {
-    drawAaCentered(AA_FONT_LARGE, timerText, 120, 40, WHITE);
+  // Clear and redraw the timer/status area.
+  // gfx->fillRect(25, 44, 190, 66, 0x2104);
+
+  // Erase only the previous text pixels, rather than clearing a large rectangle.
+  if (capturePageDrawn) {
+  if (lastCaptureTimerText.length()) {
+    drawAaCenteredTo(
+        gfx,
+        AA_FONT_LARGE,
+        lastCaptureTimerText,
+        120,
+        40,
+        0x2104,
+        0x2104);
+      }
+
+  if (lastCaptureStatusText.length()) {
+    // Clear both possible status positions because the text moves when
+    // capture changes from Recording to Download via WiFi.
+    drawAaCenteredTo(
+        gfx,
+        AA_FONT_SMALL,
+        lastCaptureStatusText,
+        120,
+        76,
+        0x2104,
+        0x2104);
+
+    drawAaCenteredTo(
+        gfx,
+        AA_FONT_SMALL,
+        lastCaptureStatusText,
+        120,
+        88,
+        0x2104,
+        0x2104);
+      }
   }
-  drawAaCentered(AA_FONT_SMALL, statusText, 120, captureSaved ? 66 : 88, captureActive || captureSaved ? 0xFFE0 : COLOR_DIM_TEXT);
+
+// Draw the new timer.
+  if (timerText.length()) {
+  drawAaCenteredTo(
+      gfx,
+      AA_FONT_LARGE,
+      timerText,
+      120,
+      40,
+      WHITE,
+      0x2104);
+  }
+
+// Draw the new status.
+  
+drawAaCenteredTo(
+    gfx,
+    AA_FONT_SMALL,
+    statusText,
+    120,
+    captureSaved ? 76 : 88,
+    captureActive || captureSaved ? 0xFFE0 : COLOR_DIM_TEXT,
+    0x2104);
+
+  drawAaCentered(AA_FONT_SMALL,
+                 statusText,
+                 120,
+                 captureSaved ? 76 : 88,
+                 captureActive || captureSaved ? 0xFFE0 : COLOR_DIM_TEXT);
+
+  // Clear only the value fields, leaving labels untouched.
+  gfx->fillRect(108, 114, 92, 58, 0x2104);
 
   gfx->setTextSize(1);
-  gfx->setTextColor(COLOR_DIM_TEXT);
-  gfx->setCursor(42, 118);
-  gfx->print("Packets");
-  gfx->setCursor(42, 138);
-  gfx->print("Strongest");
-  gfx->setCursor(42, 158);
-  gfx->print("RSSI");
-
   gfx->setTextColor(WHITE);
+
   gfx->setCursor(126, 118);
   gfx->print(String(capturePacketCount).substring(0, 8));
+
   gfx->setCursor(112, 138);
   gfx->print(captureDeviceLabel().substring(0, 16));
-  gfx->setCursor(126, 158);
-  gfx->print(captureStrongestRssi > -127 ? String(captureStrongestRssi) + "dBm" : "-");
 
-  if (captureActive) {
-    gfx->drawRect(78, 178, 84, 28, 0x6B4D);
-    gfx->fillRect(79, 179, 82, 26, 0x7820);
-    drawAaCentered(AA_FONT_SMALL, "Stop", 120, 176, WHITE);
-  } else if (captureSaved) {
-    gfx->drawRect(82, 178, 76, 28, 0x6B4D);
-    gfx->fillRect(83, 179, 74, 26, 0x24A7);
-    drawAaCentered(AA_FONT_SMALL, "Done", 120, 178, WHITE);
-  }
+  gfx->setCursor(126, 158);
+  gfx->print(captureStrongestRssi > -127
+                 ? String(captureStrongestRssi) + "dBm"
+                 : "-");
 
   lastCaptureTimerText = timerText;
   lastCaptureStatusText = statusText;
   lastCapturePacketText = String(capturePacketCount);
   lastCaptureStrongestText = captureDeviceLabel();
-  lastCaptureRssiText = captureStrongestRssi > -127 ? String(captureStrongestRssi) + "dBm" : "-";
-  lastCaptureButtonText = captureActive ? "Stop" : (captureSaved ? "Done" : "");
+  lastCaptureRssiText = captureStrongestRssi > -127
+                            ? String(captureStrongestRssi) + "dBm"
+                            : "-";
+  lastCaptureButtonText = captureActive
+                              ? "Stop"
+                              : (captureSaved ? "Done" : "");
+
   capturePageDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static void drawCurrentPage(bool force) {
@@ -3153,7 +3335,6 @@ static void drawGaugeValues(bool force = false) {
   lastErrorText = errorText;
   drawSettingsButton(COLOR_PANEL_BLUE, WHITE);
   gaugeValuesDrawn = true;
-  gfx->flush();  // Push canvas to screen
 }
 
 static void updateBleWatchdog() {
@@ -3336,31 +3517,49 @@ static void updateTouchSwipe() {
     togglePageFromSwipe(dx < 0 ? -1 : 1);
   }
 }
+static void printRuntimeStats(const char *label) {
+  Serial.println();
+  Serial.printf("=== Runtime stats: %s ===\n", label);
+  Serial.printf("Uptime:             %lu s\n",
+                static_cast<unsigned long>(millis() / 1000UL));
+  Serial.printf("Free heap:          %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Minimum free heap:  %u bytes\n", ESP.getMinFreeHeap());
+  Serial.printf("Largest free block: %u bytes\n", ESP.getMaxAllocHeap());
+  Serial.printf("LittleFS used:      %u / %u bytes\n",
+                static_cast<unsigned>(LittleFS.usedBytes()),
+                static_cast<unsigned>(LittleFS.totalBytes()));
+  Serial.printf("WiFi mode:          %d\n",
+                static_cast<int>(WiFi.getMode()));
+  Serial.printf("Settings WiFi:      %s\n",
+                settingsServerActive ? "active" : "off");
+  Serial.printf("BLE capture:        %s\n",
+                captureActive ? "active" : "off");
+  Serial.println("==============================");
+}
 
 void setup() {
   Serial.begin(115200);
   delay(300);
+  Serial.println("*** PAJERO PROFILE BUILD ***");
   loadStoredSecrets();
 
   initBacklight();
   noteTouchActivity();
 
-  if (!output_display->begin(80000000)) {
-    Serial.println("Display init failed");
-  }
-  if (!gfx->begin()) {
-    Serial.println("Canvas init failed");
-  }
+  if (!gfx->begin(80000000)) {
+  Serial.println("Display init failed");
+}
 
-  // Only the physical panel rotates. Arduino_Canvas::flush() blits its framebuffer
-  // to output_display unrotated, so rotating the Canvas itself would double-apply
-  // the rotation. Keep the canvas at 0 and let output_display's MADCTL do the work.
-  gfx->setRotation(0);
-  output_display->setRotation(currentDisplayRotation);
+  gfx->setRotation(currentDisplayRotation);
+
   initTouch();
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS init failed");
-  }
+  } //else {
+  //  Serial.println("Formatting LittleFS...");
+  //  LittleFS.format();
+  //  Serial.println("LittleFS formatted");
+ // } uncomment to format LittleFS on first boot if needed
   drawCurrentPage(true);
 
   NimBLEDevice::init("round-battery-dashboard");
@@ -3376,14 +3575,22 @@ void setup() {
   scan->start(0, false, false);
   lastBleScanStartMs = millis();
   Serial.println("BLE scan started");
+  printRuntimeStats("startup complete");
 }
 
 void loop() {
   static uint32_t lastDraw = 0;
+  static uint32_t lastStatsPrintMs = 0;
   updateSettingsServer();
   updateBleWatchdog();
   updateTouchSwipe();
   updateScreenTimeout();
+  if (millis() - lastStatsPrintMs >= 10000UL) {
+  lastStatsPrintMs = millis();
+  printRuntimeStats(settingsServerActive
+                        ? "WiFi active"
+                        : "normal operation");
+  }
 
   if (captureActive && millis() - captureStartMs >= CAPTURE_DURATION_MS) {
     stopCapture("timer");
